@@ -1,85 +1,97 @@
 THIS IS THE OLD VERSION README I STILL NEED TO UPDAE IT BUT BASICALLY THE SAME WITH SOME NEW VISUAL MODES ETC...  MUST TACKLE CPU LOAD NEXT IT IS A BEAST.
-
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![JUCE](https://img.shields.io/badge/Built%20with-JUCE%208-blue)](https://juce.com)
-[![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey)]()
+[![Platform](https://img.shields.io/badge/Platform-Windows)]()
 [![Format](https://img.shields.io/badge/Format-VST3%20%7C%20-orange)]()
 
 ## Author: **William Ashley** — AlphaAudio
 ## Project: *The Loud Tool* (TLT)
 
-**Purpose:** Loudness maximization, dynamics control, and real-time broadcast-style metering.
+**Purpose:** Advanced loudness maximization, multiband density control, harmonic texture, phase enhancement, and professional broadcast-style metering.
 
-# The Its Loud Tool
+# The Loud Tool
 
-A powerful loudness enhancement and monitoring utility that brings your mixes up to competitive streaming/broadcast levels while preserving punch and transparency. Built with **JUCE 8** as a VST3 (and AU/AAX compatible) plugin.
+A comprehensive final-stage loudness and dynamics processor designed to bring mixes to competitive streaming, broadcast, and mastering levels while maintaining punch, clarity, and transparency.
 
-It combines perceptual auto-makeup gain, harmonic saturation (exciter), a transparent lookahead limiter, and accurate BS.1770-4 loudness metering in one cohesive rack-style interface.
+Built with **JUCE 8** as a VST3 (AU/AAX compatible) plugin. It features perceptual loudness targeting, oversampled saturation, true-peak limiting, multiband compression for density, phase rotation, and rich real-time metering.
 
 ## What It Does
 
-The Its Loud Tool is designed for final-stage loudness management — perfect for mastering, streaming prep, broadcast, or live tracking where you need both loudness and clarity.
+The Its Loud Tool combines several pro-level tools into one cohesive rack-style unit:
 
-### Key Features
 | Section | Function |
 |---------|----------|
-| **Perceptual Gain** | Smart auto-makeup that targets your chosen LUFS (Momentary-based) with smooth, musical response. |
-| **Texture / Harmonic Exciter** | Oversampled asymmetric tanh saturation for adding density and presence without harshness (drive 1–5x). |
-| **True Peak Limiter** | 5ms lookahead brickwall limiter with ceiling control. Protects against inter-sample peaks. |
-| **Loudness Metering** | Full BS.1770 metering: **Integrated**, **Short-Term**, **Momentary** LUFS + True Peak + held peak. |
-| **Monitoring Tools** | Cycle between metering modes, reset integrated loudness, export CSV snapshot, bypass. |
+| **TARGET LUFS** | Perceptual auto-makeup gain targeting user-selected integrated LUFS standards (-30 to -8). |
+| **TEXTURE (Exciter)** | Oversampled asymmetric harmonic saturation (1–5x drive) for adding density and presence. |
+| **CEILING** | Lookahead true-peak brickwall limiter with adjustable ceiling. |
+| **MULTIBAND DENSITY** | 3-band compression (Low/Mid/High) with adjustable thresholds for controlled density without squashing transients. |
+| **PHASE** | Subtle all-pass phase rotation for improved mono compatibility and low-end tightness. |
+| **Advanced Metering** | Full BS.1770-style LUFS (Integrated/Short-Term/Momentary), True Peak, multiple measurement modes (K-weighted, A-weighted, RMS, dBu), and analog-style VU/PPM with selectable ballistics. |
+
+Additional tools: **RESET INT**, **MODE** cycling (measurement type), **INT** standard cycling (EBU R128, Streaming, ATSC A/85, Apple Music, Custom), **VU** ballistic modes, **VIEW** (AID spectral bars / A/B comparison), and **EXPORT CSV**.
 
 ## Signal Flow
 
-Stereo In → Perceptual Makeup Gain (target LUFS)  
-→ Oversampled Harmonic Exciter (saturation)  
-→ Lookahead True Peak Limiter (ceiling)  
-→ BS.1770 Metering (final output) → Stereo Out
+Input → A/B Pre-Process Level Capture  
+→ Multiband Density Compression (optional)  
+→ Phase Rotation (optional)  
+→ Perceptual Makeup Gain (to target LUFS)  
+→ Harmonic Exciter / Saturation (oversampled)  
+→ True-Peak Lookahead Limiter  
+→ Post-Process Metering & Output
 
-- **Oversampling**: 2x with high-quality FIR half-band filters.
-- **Latency**: Reported to host (oversampling + lookahead).
-- **Mono compatibility**: Handles mono inputs gracefully.
-- All parameters use atomic variables for thread-safe UI ↔ Audio communication.
+- **Oversampling**: 2x with high-quality filters.
+- **Latency**: Automatically reported (oversampling + lookahead).
+- **Mono handling**: Graceful fallback.
 
 ## UI Design
 
-- **Rack-mount aesthetic** with dark chassis, side ears, and screws.
-- Custom **BroadcastKnob** LookAndFeel with glowing teal accents and detailed rotary graphics.
-- Large **VU-style meter** with needle, peak LED, and tick marks.
-- LCD-style digital readout showing real-time Integrated / Short / Momentary LUFS, mode, and True Peak.
-- Compact, resizable editor window (default **750 × 340 px**).
+- **Professional rack-mount aesthetic** with dark chassis, side ears, screws, and teal/orange accents.
+- Custom **BroadcastKnob** rotary controls with glowing indicators and detailed graphics.
+- Large **analog-style VU/PPM meter** with needle, peak LED, and realistic face (including "TLT" branding).
+- **LCD-style digital display** for real-time loudness readings, standards, and modes.
+- **Resizable editor** (default **850 × 420 px**, min 750×380).
 
-## Controls
-- **TARGET LUFS** (-30 to -8): Desired loudness target (uses smoothed Momentary measurement).
-- **TEXTURE** (1–5x): Drive amount for the harmonic exciter.
-- **CEILING** (-10 to 0 dBTP): Limiter output ceiling.
-- Buttons: RESET INT (Integrated), MODE (cycle metering display), EXPORT CSV, BYPASS.
+## Controls Summary
+
+- **TARGET** (-30 to -8 LUFS): Loudness target + standard cycling.
+- **TEXTURE** (1–5x): Saturation drive.
+- **CEILING** (-10 to 0 dBTP): Limiter ceiling.
+- **LOW / MID / HIGH**: Multiband compression thresholds.
+- **PHASE** (0–1): Phase rotator blend.
+- Buttons for all metering/view/export functions.
 
 ## Technical Notes
-- **Sample-accurate** parameter handling with atomic floats.
-- Custom **BS.1770-style** K-weighted filtering for loudness calculation.
-- Ring buffers for Momentary (400ms), Short-Term (3s), and Integrated measurements.
-- True Peak detection with hold and decay.
-- State saving is minimal (parameters are host-managed via APVTS-ready structure; full serialization can be expanded).
 
-## Factory / Default Behavior
-Starts with sensible defaults:
-- Target: **-14 LUFS**
+- **Thread-safe atomics** for all parameters and meter values.
+- Multiple measurement engines: K-weighted (BS.1770), A-weighted, unweighted RMS, dBu (EBU/SMPTE).
+- Custom A-weighting IIR filters and VU/PPM ballistics (Classic VU & BBC PPM).
+- Multiband IIR crossovers + envelope followers with fast attack/slow release.
+- Ring buffers for short-term and integrated loudness.
+- True-peak detection with hold.
+- Full state save/load via JUCE serialization.
+- **AID (Auditory Information Density)** spectral analysis for visual feedback.
+
+## Default Settings
+
+- Target: **-14 LUFS** (Streaming)
 - Texture: **2.0x**
 - Ceiling: **-1 dBTP**
-
-Version 1.0 — GUI polish and additional presets/modes planned for v2.
+- Multiband enabled with sensible thresholds.
 
 ## Building
-Requires **JUCE 8** and a C++20 compiler. Standard JUCE audio plugin project.  
-The compiled `.vst3` is included in the repo root for quick testing.
+
+Requires **JUCE 8** and C++20. Standard JUCE audio plugin project structure.  
+Compiled `.vst3` included in the repo for quick testing.
 
 ## Quick Install (Windows)
-Copy the `theitsloudtool.vst3` folder to:  
+
+Copy the `.vst3` folder to:  
 `C:\Program Files\Common Files\VST3\`  
-Rescan plugins in your DAW. It appears as **The Its Loud Tool** (or VIAU-MAX internally).
+Rescan in your DAW. Plugin name: **The Its Loud Tool** (VIAU-MAX internally).
 
 ## Website & Contact
+
 - Website: [williamashley.music](http://williamashley.music)
 - Email: contact@williamashley.music
 
@@ -89,18 +101,18 @@ Copyright (c) 2026 William Ashley d/b/a William Ashley Music ( http://WilliamAsh
 
 This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License (v3).
 
-This program is distributed in the hope that it will be useful to other audio programmers and music makers. There is no WARRANTY expressed or implied.
+This program is distributed in the hope that it will be useful... (standard GPL notice)
 
-Attribution is requested where possible. Notice of use is appreciated.
+Attribution and notice of use appreciated.
 
 ---
 
 ## Third-Party Licenses
-Built using the **JUCE framework** (© Raw Material Software Limited).  
-See [JUCE License](https://juce.com) for details.
 
+Built using the **JUCE framework** (© Raw Material Software Limited).  
 VST3 is a trademark of Steinberg Media Technologies GmbH.
 
+ 
  NOTE: This plugin was inspired by the Dolby LM100 Broadcast Loudness meter but no dolby sourcecode was used in its development. It expands on the idea
  of a loudness monitor and aims to apply specific loudness monitoring methods to become loudness transforms using a variety of loudness theories that will be touched on as they are developed more into this plugins next version.
 
