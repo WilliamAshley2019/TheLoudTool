@@ -127,6 +127,28 @@ void ViaU2AudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
     peakEnv = 0.0f;
     currentGainReduction = 1.0f;
     smoothedMakeupGain = 1.0f;
+    limiterPeakDeque.clear();
+
+    // Precompute limiter time constants once here instead of recomputing
+    // std::exp() on every single processBlock call (cheap but needless churn).
+    limiterAttackCoeff = 1.0f - std::exp(-1.0f / (static_cast<float>(sampleRate) * 0.001f));
+    limiterReleaseCoeff = 1.0f - std::exp(-1.0f / (static_cast<float>(sampleRate) * 0.050f));
+    mbAttackCoeff = 1.0f - std::exp(-1.0f / (static_cast<float>(sampleRate) * 0.005f));
+    mbReleaseCoeff = 1.0f - std::exp(-1.0f / (static_cast<float>(sampleRate) * 0.100f));
+
+    // Precompute Goertzel coefficients for the 24 Bark-centre frequencies.
+    // coeff[b] = 2 * cos(2π * f_b / fs) — computed once, used every block.
+    static constexpr std::array<float, 24> barkCenters = {
+        50.f, 150.f, 250.f, 350.f, 450.f, 570.f, 700.f, 840.f,
+        1000.f, 1170.f, 1370.f, 1600.f, 1850.f, 2150.f, 2500.f, 2900.f,
+        3300.f, 3700.f, 4400.f, 5100.f, 5800.f, 6800.f, 8000.f, 10000.f
+    };
+    for (int b = 0; b < 24; ++b)
+        goertzelCoeff[static_cast<size_t>(b)] = 2.0f * std::cos(2.0f * juce::MathConstants<float>::pi
+            * barkCenters[static_cast<size_t>(b)] / static_cast<float>(sampleRate));
+    goertzelN = samplesPerBlock > 0 ? samplesPerBlock : 512;
+    barkBandLevels.fill(0.0f);
+    aidUpdateCounter = 0;
 
     setLatencySamples(static_cast<int>(oversampling.getLatencyInSamples()) + lookaheadSamples);
 }
@@ -215,14 +237,17 @@ void ViaU2AudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
         threshLin[1] = juce::Decibels::decibelsToGain(midBandThresh.load(std::memory_order_relaxed));
         threshLin[2] = juce::Decibels::decibelsToGain(highBandThresh.load(std::memory_order_relaxed));
 
-        const float attackCoeff = 1.0f - std::exp(-1.0f / (sampleRateF * 0.005f));
-        const float releaseCoeff = 1.0f - std::exp(-1.0f / (sampleRateF * 0.100f));
+        const float attackCoeff = mbAttackCoeff;
+        const float releaseCoeff = mbReleaseCoeff;
         const float ratio = 3.0f;
+
+        float* mbPtrL = buffer.getWritePointer(0);
+        float* mbPtrR = numChannels > 1 ? buffer.getWritePointer(1) : nullptr;
 
         for (int n = 0; n < numSamples; ++n)
         {
-            float inL = buffer.getSample(0, n);
-            float inR = numChannels > 1 ? buffer.getSample(1, n) : inL;
+            float inL = mbPtrL[n];
+            float inR = (mbPtrR != nullptr) ? mbPtrR[n] : inL;
             float outL = 0.0f, outR = 0.0f;
             float bandSig[3][2];
 
@@ -290,8 +315,8 @@ void ViaU2AudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
                 outR += bandSig[b][1];
             }
 
-            buffer.setSample(0, n, outL);
-            if (numChannels > 1) buffer.setSample(1, n, outR);
+            mbPtrL[n] = outL;
+            if (mbPtrR != nullptr) mbPtrR[n] = outR;
         }
     }
     else
@@ -305,10 +330,13 @@ void ViaU2AudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
     // =====================================================================
     if (doPhase)
     {
+        float* phPtrL = buffer.getWritePointer(0);
+        float* phPtrR = numChannels > 1 ? buffer.getWritePointer(1) : nullptr;
+
         for (int n = 0; n < numSamples; ++n)
         {
-            float inL = buffer.getSample(0, n);
-            float inR = numChannels > 1 ? buffer.getSample(1, n) : inL;
+            float inL = phPtrL[n];
+            float inR = (phPtrR != nullptr) ? phPtrR[n] : inL;
             float rotL = inL, rotR = inR;
 
             for (int s = 0; s < 4; ++s)
@@ -317,9 +345,9 @@ void ViaU2AudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
                 rotR = phaseRotatorR[static_cast<size_t>(s)].processSample(rotR);
             }
 
-            buffer.setSample(0, n, inL * (1.0f - phaseBlend) + rotL * phaseBlend);
-            if (numChannels > 1)
-                buffer.setSample(1, n, inR * (1.0f - phaseBlend) + rotR * phaseBlend);
+            phPtrL[n] = inL * (1.0f - phaseBlend) + rotL * phaseBlend;
+            if (phPtrR != nullptr)
+                phPtrR[n] = inR * (1.0f - phaseBlend) + rotR * phaseBlend;
         }
     }
 
@@ -345,41 +373,50 @@ void ViaU2AudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
     }
 
     // =====================================================================
-    // 4. LOOKAHEAD LIMITER (Always active for safety)
+    // 4. LOOKAHEAD LIMITER — O(N) sliding-window maximum (monotone deque)
+    //    instead of the previous O(N×lookahead) inner scan.
+    //    The deque holds {peak, ringbuffer-position} pairs in decreasing order
+    //    of peak; the front is always the maximum in the current lookahead window.
     // =====================================================================
     {
-        float ceilingLin = juce::Decibels::decibelsToGain(ceilingDB.load(std::memory_order_relaxed));
-        float attackCoeff = 1.0f - std::exp(-1.0f / (sampleRateF * 0.001f));
-        float releaseCoeff = 1.0f - std::exp(-1.0f / (sampleRateF * 0.050f));
+        const float ceilingLin = juce::Decibels::decibelsToGain(ceilingDB.load(std::memory_order_relaxed));
+        float* outPtrL = buffer.getWritePointer(0);
+        float* outPtrR = numChannels > 1 ? buffer.getWritePointer(1) : nullptr;
 
         for (int n = 0; n < numSamples; ++n)
         {
-            float inL = buffer.getSample(0, n);
-            float inR = numChannels > 1 ? buffer.getSample(1, n) : inL;
+            const float inL = outPtrL[n];
+            const float inR = (outPtrR != nullptr) ? outPtrR[n] : inL;
+            const float absPeak = juce::jmax(std::abs(inL), std::abs(inR));
 
+            // Write new sample into the ring buffer
             lookaheadBufferL[static_cast<size_t>(lookaheadWritePos)] = inL;
             lookaheadBufferR[static_cast<size_t>(lookaheadWritePos)] = inR;
 
-            float maxPeak = 0.0f;
-            for (int i = 0; i < lookaheadSamples; ++i)
-            {
-                int idx = (lookaheadWritePos - i + lookaheadSamples) % lookaheadSamples;
-                maxPeak = juce::jmax(maxPeak, std::abs(lookaheadBufferL[static_cast<size_t>(idx)]));
-                maxPeak = juce::jmax(maxPeak, std::abs(lookaheadBufferR[static_cast<size_t>(idx)]));
-            }
+            // Maintain the monotone deque: remove back entries smaller than
+            // the new sample (they can never be the maximum going forward)
+            while (!limiterPeakDeque.empty() && limiterPeakDeque.back().first <= absPeak)
+                limiterPeakDeque.pop_back();
+            limiterPeakDeque.push_back({ absPeak, lookaheadWritePos });
 
-            if (maxPeak > peakEnv) peakEnv += attackCoeff * (maxPeak - peakEnv);
-            else                   peakEnv += releaseCoeff * (maxPeak - peakEnv);
+            // Remove front entry if it has exited the lookahead window
+            const int oldest = (lookaheadWritePos - lookaheadSamples + 2 * lookaheadSamples) % lookaheadSamples;
+            if (limiterPeakDeque.front().second == oldest)
+                limiterPeakDeque.pop_front();
 
-            float gr = (peakEnv > ceilingLin && peakEnv > 0.0001f) ? (ceilingLin / peakEnv) : 1.0f;
+            // Front of deque = maximum peak in window — O(1) lookup
+            const float maxPeak = limiterPeakDeque.empty() ? absPeak : limiterPeakDeque.front().first;
+
+            if (maxPeak > peakEnv) peakEnv += limiterAttackCoeff * (maxPeak - peakEnv);
+            else                   peakEnv += limiterReleaseCoeff * (maxPeak - peakEnv);
+
+            const float gr = (peakEnv > ceilingLin && peakEnv > 0.0001f) ? (ceilingLin / peakEnv) : 1.0f;
             currentGainReduction += 0.1f * (gr - currentGainReduction);
 
-            int readPos = (lookaheadWritePos - lookaheadSamples + lookaheadSamples) % lookaheadSamples;
-            float outL = lookaheadBufferL[static_cast<size_t>(readPos)] * currentGainReduction;
-            float outR = lookaheadBufferR[static_cast<size_t>(readPos)] * currentGainReduction;
-
-            buffer.setSample(0, n, outL);
-            if (numChannels > 1) buffer.setSample(1, n, outR);
+            const int readPos = (lookaheadWritePos - lookaheadSamples + 2 * lookaheadSamples) % lookaheadSamples;
+            outPtrL[n] = lookaheadBufferL[static_cast<size_t>(readPos)] * currentGainReduction;
+            if (outPtrR != nullptr)
+                outPtrR[n] = lookaheadBufferR[static_cast<size_t>(readPos)] * currentGainReduction;
 
             lookaheadWritePos = (lookaheadWritePos + 1) % lookaheadSamples;
         }
@@ -396,6 +433,12 @@ void ViaU2AudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
     const auto activeVuMode = vuBallisticMode.load(std::memory_order_relaxed);
     const bool vuUsesAWeight = (activeVuMode == VuBallisticMode::ClassicVU_A || activeVuMode == VuBallisticMode::PPM_A);
     const bool vuIsPpm = (activeVuMode == VuBallisticMode::PPM_K || activeVuMode == VuBallisticMode::PPM_A);
+    // Only run A-weighting when a mode that actually needs it is selected.
+    // The filter runs every sample, so skipping it when unused saves ~8 biquad
+    // evaluations per sample — meaningful at 96kHz or with large block sizes.
+    const bool needsAWeight = (activeMeasMode == MeasurementMode::AWeightedLeqA) || vuUsesAWeight;
+    const bool needsUnweighted = (activeMeasMode == MeasurementMode::UnweightedRMS
+        || activeMeasMode == MeasurementMode::Dbu);
 
     for (int n = 0; n < numSamples; ++n)
     {
@@ -408,12 +451,17 @@ void ViaU2AudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
         const float rightPower = rightFiltered * rightFiltered;
         const float framePower = leftPower + rightPower;
 
-        // --- A-weighted parallel signal path (feeds LEQ(A) mode + A-weighted VU/PPM) ---
-        const float leftAWeighted = aWeightL.processSample(leftIn[n]);
-        const float rightAWeighted = aWeightR.processSample(rightIn[n]);
-        const float leftAPower = leftAWeighted * leftAWeighted;
-        const float rightAPower = rightAWeighted * rightAWeighted;
-        const float frameAPower = leftAPower + rightAPower;
+        // --- A-weighted parallel path (only processed when needed) ---
+        float leftAWeighted = 0.0f, rightAWeighted = 0.0f;
+        float leftAPower = 0.0f, rightAPower = 0.0f, frameAPower = 0.0f;
+        if (needsAWeight)
+        {
+            leftAWeighted = aWeightL.processSample(leftIn[n]);
+            rightAWeighted = aWeightR.processSample(rightIn[n]);
+            leftAPower = leftAWeighted * leftAWeighted;
+            rightAPower = rightAWeighted * rightAWeighted;
+            frameAPower = leftAPower + rightAPower;
+        }
 
         // --- Unweighted parallel signal (feeds Unweighted RMS + dBu modes) ---
         const float leftUnweightedPower = leftIn[n] * leftIn[n];
@@ -434,13 +482,16 @@ void ViaU2AudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
         if (momentarySum > 0.0 && currentMomCount > 0)
             currentMomentaryLUFS.store(static_cast<float>(-0.691 + 10.0 * std::log10(momentarySum / (currentMomCount * 2.0) + 1e-12)), std::memory_order_relaxed);
 
-        // A-weighted momentary (LEQ(A) mode)
-        float oldAMomL = aWeightedMomBufferL[static_cast<size_t>(aWeightedMomWritePos)];
-        float oldAMomR = aWeightedMomBufferR[static_cast<size_t>(aWeightedMomWritePos)];
-        aWeightedMomBufferL[static_cast<size_t>(aWeightedMomWritePos)] = leftAPower;
-        aWeightedMomBufferR[static_cast<size_t>(aWeightedMomWritePos)] = rightAPower;
-        aWeightedMomSum += frameAPower - (oldAMomL + oldAMomR);
-        aWeightedMomWritePos = (aWeightedMomWritePos + 1) % maxMomSamples;
+        // A-weighted momentary (LEQ(A) mode) — only updated when needed
+        if (needsAWeight)
+        {
+            float oldAMomL = aWeightedMomBufferL[static_cast<size_t>(aWeightedMomWritePos)];
+            float oldAMomR = aWeightedMomBufferR[static_cast<size_t>(aWeightedMomWritePos)];
+            aWeightedMomBufferL[static_cast<size_t>(aWeightedMomWritePos)] = leftAPower;
+            aWeightedMomBufferR[static_cast<size_t>(aWeightedMomWritePos)] = rightAPower;
+            aWeightedMomSum += frameAPower - (oldAMomL + oldAMomR);
+            aWeightedMomWritePos = (aWeightedMomWritePos + 1) % maxMomSamples;
+        }
 
         // Unweighted momentary (Unweighted RMS + dBu modes)
         float oldUMomL = unweightedMomBufferL[static_cast<size_t>(unweightedMomWritePos)];
@@ -457,30 +508,30 @@ void ViaU2AudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
         {
             switch (activeMeasMode)
             {
-                case MeasurementMode::KWeightedMomentary:
-                    // Already published above via currentMomentaryLUFS; mirror it here too.
-                    currentMeasurementValue.store(currentMomentaryLUFS.load(std::memory_order_relaxed), std::memory_order_relaxed);
-                    break;
-                case MeasurementMode::AWeightedLeqA:
-                    if (aWeightedMomSum > 0.0)
-                        currentMeasurementValue.store(static_cast<float>(-0.691 + 10.0 * std::log10(aWeightedMomSum / (currentMomCount * 2.0) + 1e-12)), std::memory_order_relaxed);
-                    break;
-                case MeasurementMode::UnweightedRMS:
-                    if (unweightedMomSum > 0.0)
-                        currentMeasurementValue.store(static_cast<float>(10.0 * std::log10(unweightedMomSum / (currentMomCount * 2.0) + 1e-12)), std::memory_order_relaxed);
-                    break;
-                case MeasurementMode::Dbu:
+            case MeasurementMode::KWeightedMomentary:
+                // Already published above via currentMomentaryLUFS; mirror it here too.
+                currentMeasurementValue.store(currentMomentaryLUFS.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                break;
+            case MeasurementMode::AWeightedLeqA:
+                if (aWeightedMomSum > 0.0)
+                    currentMeasurementValue.store(static_cast<float>(-0.691 + 10.0 * std::log10(aWeightedMomSum / (currentMomCount * 2.0) + 1e-12)), std::memory_order_relaxed);
+                break;
+            case MeasurementMode::UnweightedRMS:
+                if (unweightedMomSum > 0.0)
+                    currentMeasurementValue.store(static_cast<float>(10.0 * std::log10(unweightedMomSum / (currentMomCount * 2.0) + 1e-12)), std::memory_order_relaxed);
+                break;
+            case MeasurementMode::Dbu:
+            {
+                if (unweightedMomSum > 0.0)
                 {
-                    if (unweightedMomSum > 0.0)
-                    {
-                        const float dbfs = static_cast<float>(10.0 * std::log10(unweightedMomSum / (currentMomCount * 2.0) + 1e-12));
-                        // EBU R68: -18 dBFS = 0 dBu  |  SMPTE RP155: -20 dBFS = +4 dBu (0 dBu at -24 dBFS)
-                        const float dbuOffset = (dbuReference.load(std::memory_order_relaxed) == DbuReference::EBU_R68) ? 18.0f : 24.0f;
-                        currentMeasurementValue.store(dbfs + dbuOffset, std::memory_order_relaxed);
-                    }
-                    break;
+                    const float dbfs = static_cast<float>(10.0 * std::log10(unweightedMomSum / (currentMomCount * 2.0) + 1e-12));
+                    // EBU R68: -18 dBFS = 0 dBu  |  SMPTE RP155: -20 dBFS = +4 dBu (0 dBu at -24 dBFS)
+                    const float dbuOffset = (dbuReference.load(std::memory_order_relaxed) == DbuReference::EBU_R68) ? 18.0f : 24.0f;
+                    currentMeasurementValue.store(dbfs + dbuOffset, std::memory_order_relaxed);
                 }
-                default: break;
+                break;
+            }
+            default: break;
             }
         }
 
@@ -540,31 +591,45 @@ void ViaU2AudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
     }
     peakHit.store(peakDb >= -0.3f, std::memory_order_relaxed);
 
-    if (++aidUpdateCounter >= 10)
+    // =====================================================================
+    // AID BARK-BAND ANALYSIS — Goertzel algorithm (O(N) per band, no sin/cos
+    // in the inner loop). Only runs when the VIEW button shows an AID bar-graph
+    // (styles 0-4); skips entirely for A/B (5) and overlay (6) views.
+    // Also skips if the plugin is bypassed since the user likely cares less
+    // about spectral analysis in that state.
+    // =====================================================================
+    const int currentView = aidViewStyle.load(std::memory_order_relaxed);
+    const bool aidViewActive = (currentView >= 0 && currentView <= 4);
+
+    if (aidViewActive && !isBypassed.load(std::memory_order_relaxed) && ++aidUpdateCounter >= 4)
     {
         aidUpdateCounter = 0;
-        static const std::array<float, 24> barkCenters = {
-            50.f, 150.f, 250.f, 350.f, 450.f, 570.f, 700.f, 840.f,
-            1000.f, 1170.f, 1370.f, 1600.f, 1850.f, 2150.f, 2500.f, 2900.f,
-            3300.f, 3700.f, 4400.f, 5100.f, 5800.f, 6800.f, 8000.f, 10000.f
-        };
 
+        // Mono sum for spectral analysis (saves processing one channel worth of Goertzel)
+        const int N = numSamples;
         float totalActive = 0.0f;
         const float noiseFloorLin = juce::Decibels::decibelsToGain(-70.0f);
 
         for (int b = 0; b < 24; ++b)
         {
-            float energy = 0.0f;
-            for (int n = 0; n < numSamples; ++n)
+            // Goertzel: two-multiply-add recurrence, no trig per sample.
+            // s[n] = x[n] + coeff * s[n-1] - s[n-2]
+            // Magnitude² = s[N-1]² + s[N-2]² - coeff * s[N-1] * s[N-2]
+            const float coeff = goertzelCoeff[static_cast<size_t>(b)];
+            float s1 = 0.0f, s2 = 0.0f;
+            for (int n = 0; n < N; ++n)
             {
-                float s = 0.5f * (leftIn[n] + rightIn[n]);
-                float phase = 2.0f * juce::MathConstants<float>::pi * barkCenters[static_cast<size_t>(b)] * static_cast<float>(n) / sampleRateF;
-                energy += std::abs(s * std::sin(phase));
+                const float monoSample = 0.5f * (leftIn[n] + rightIn[n]);
+                const float s0 = monoSample + coeff * s1 - s2;
+                s2 = s1;
+                s1 = s0;
             }
-            energy /= static_cast<float>(numSamples);
+            // Power estimate normalized by block size
+            const float power = (s1 * s1 + s2 * s2 - coeff * s1 * s2) / static_cast<float>(N * N);
+            const float energy = std::sqrt(juce::jmax(0.0f, power));
 
             float& disp = barkBandLevels[static_cast<size_t>(b)];
-            disp = disp * 0.7f + energy * 0.3f;
+            disp = disp * 0.75f + energy * 0.25f; // exponential smoothing
 
             if (disp > noiseFloorLin) totalActive += 1.0f;
         }

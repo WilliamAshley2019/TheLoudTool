@@ -4,6 +4,7 @@
 #include <atomic>
 #include <vector>
 #include <array>
+#include <deque>
 
 // Professional loudness target standards the INT button cycles through.
 // Selecting a standard sets targetLUFS (the same atomic the TARGET knob
@@ -122,11 +123,11 @@ public:
     {
         switch (standard)
         {
-            case LoudnessStandard::EBU_R128:   return -23.0f;
-            case LoudnessStandard::Streaming:  return -14.0f;
-            case LoudnessStandard::ATSC_A85:   return -24.0f;
-            case LoudnessStandard::AppleMusic: return -16.0f;
-            default:                           return -23.0f;
+        case LoudnessStandard::EBU_R128:   return -23.0f;
+        case LoudnessStandard::Streaming:  return -14.0f;
+        case LoudnessStandard::ATSC_A85:   return -24.0f;
+        case LoudnessStandard::AppleMusic: return -16.0f;
+        default:                           return -23.0f;
         }
     }
 
@@ -135,12 +136,12 @@ public:
     {
         switch (getLoudnessStandard())
         {
-            case LoudnessStandard::EBU_R128:   return "EBU R128";
-            case LoudnessStandard::Streaming:  return "STREAMING";
-            case LoudnessStandard::ATSC_A85:   return "ATSC A/85";
-            case LoudnessStandard::AppleMusic: return "APPLE MUSIC";
-            case LoudnessStandard::Custom:     return "CUSTOM";
-            default:                           return "EBU R128";
+        case LoudnessStandard::EBU_R128:   return "EBU R128";
+        case LoudnessStandard::Streaming:  return "STREAMING";
+        case LoudnessStandard::ATSC_A85:   return "ATSC A/85";
+        case LoudnessStandard::AppleMusic: return "APPLE MUSIC";
+        case LoudnessStandard::Custom:     return "CUSTOM";
+        default:                           return "EBU R128";
         }
     }
 
@@ -152,7 +153,7 @@ public:
     void cycleMeasurementMode() noexcept
     {
         auto next = (static_cast<int>(measurementMode.load(std::memory_order_relaxed)) + 1)
-                    % static_cast<int>(MeasurementMode::NumMeasurementModes);
+            % static_cast<int>(MeasurementMode::NumMeasurementModes);
         measurementMode.store(static_cast<MeasurementMode>(next), std::memory_order_relaxed);
     }
 
@@ -162,7 +163,7 @@ public:
     void cycleDbuReference() noexcept
     {
         auto next = (static_cast<int>(dbuReference.load(std::memory_order_relaxed)) + 1)
-                    % static_cast<int>(DbuReference::NumDbuReferences);
+            % static_cast<int>(DbuReference::NumDbuReferences);
         dbuReference.store(static_cast<DbuReference>(next), std::memory_order_relaxed);
     }
     DbuReference getDbuReference() const noexcept { return dbuReference.load(std::memory_order_relaxed); }
@@ -172,11 +173,11 @@ public:
     {
         switch (getMeasurementMode())
         {
-            case MeasurementMode::KWeightedMomentary: return "K-WEIGHTED";
-            case MeasurementMode::AWeightedLeqA:       return "LEQ(A)";
-            case MeasurementMode::UnweightedRMS:       return "UNWEIGHTED";
-            case MeasurementMode::Dbu:                  return getDbuReference() == DbuReference::EBU_R68 ? "dBu (EBU)" : "dBu (SMPTE)";
-            default:                                    return "K-WEIGHTED";
+        case MeasurementMode::KWeightedMomentary: return "K-WEIGHTED";
+        case MeasurementMode::AWeightedLeqA:       return "LEQ(A)";
+        case MeasurementMode::UnweightedRMS:       return "UNWEIGHTED";
+        case MeasurementMode::Dbu:                  return getDbuReference() == DbuReference::EBU_R68 ? "dBu (EBU)" : "dBu (SMPTE)";
+        default:                                    return "K-WEIGHTED";
         }
     }
 
@@ -198,7 +199,7 @@ public:
     void cycleVuBallisticMode() noexcept
     {
         auto next = (static_cast<int>(vuBallisticMode.load(std::memory_order_relaxed)) + 1)
-                    % static_cast<int>(VuBallisticMode::NumVuModes);
+            % static_cast<int>(VuBallisticMode::NumVuModes);
         vuBallisticMode.store(static_cast<VuBallisticMode>(next), std::memory_order_relaxed);
     }
 
@@ -206,11 +207,11 @@ public:
     {
         switch (getVuBallisticMode())
         {
-            case VuBallisticMode::ClassicVU_K: return "VU (K)";
-            case VuBallisticMode::ClassicVU_A: return "VU (A)";
-            case VuBallisticMode::PPM_K:        return "PPM (K)";
-            case VuBallisticMode::PPM_A:        return "PPM (A)";
-            default:                             return "VU (K)";
+        case VuBallisticMode::ClassicVU_K: return "VU (K)";
+        case VuBallisticMode::ClassicVU_A: return "VU (A)";
+        case VuBallisticMode::PPM_K:        return "PPM (K)";
+        case VuBallisticMode::PPM_A:        return "PPM (A)";
+        default:                             return "VU (K)";
         }
     }
 
@@ -246,7 +247,7 @@ public:
     // 5, target-overlay 6). Lives on the processor, not the editor, so it
     // survives the editor being destroyed and recreated (e.g. closing and
     // reopening the plugin popup) instead of resetting to 0 every time.
-    std::atomic<int> aidViewStyle{ 1 }; // defaults to the segmented/block style
+    std::atomic<int> aidViewStyle{ 6 }; // defaults to target overlay (OUTPUT vs TARGET) view
 
 private:
     // ========================================================================
@@ -364,10 +365,16 @@ private:
     std::array<AllPassStage, 4> phaseRotatorR;
     std::array<float, 4> phaseFreqs{ 60.0f, 120.0f, 240.0f, 480.0f };
 
-    // AID Analyzer
-    std::array<float, 24> barkBandLevels{ 0.0f };
+    // AID Bark-band analyzer using the Goertzel algorithm (2 MACs/sample/band,
+    // no trig calls inside the audio loop — only when the AID view is visible).
+    std::array<float, 24> barkBandLevels{};
     std::atomic<float> spectralOccupancy{ 0.0f };
     int aidUpdateCounter{ 0 };
+    // Goertzel coefficients, precomputed in prepareToPlay for each of the 24
+    // Bark-center frequencies. coeff = 2 * cos(2π * f / fs).
+    std::array<float, 24> goertzelCoeff{};
+    // Block size captured at prepareToPlay for Goertzel normalization.
+    int goertzelN{ 0 };
 
     // Lookahead Limiter
     std::vector<float> lookaheadBufferL, lookaheadBufferR;
@@ -376,6 +383,17 @@ private:
     float peakEnv{ 0.0f };
     float currentGainReduction{ 1.0f };
     float smoothedMakeupGain{ 1.0f };
+
+    // Sliding-window maximum for the lookahead limiter — replaces the O(N²)
+    // inner scan with an O(N) amortized monotone deque algorithm. Each element
+    // stores {abs-peak, ringbuffer-index}, maintained in decreasing-peak order.
+    std::deque<std::pair<float, int>> limiterPeakDeque;
+
+    // Precomputed limiter time constants (set in prepareToPlay, used every block).
+    float limiterAttackCoeff{ 0.0f };
+    float limiterReleaseCoeff{ 0.0f };
+    float mbAttackCoeff{ 0.0f };  // Multiband compressor time constants
+    float mbReleaseCoeff{ 0.0f };
 
     // Oversampling
     juce::dsp::Oversampling<float> oversampling{
