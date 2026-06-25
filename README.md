@@ -1,4 +1,4 @@
-willashley11.gumroad.com/l/ustjro
+Additional content and updated version here:[TLT The Loud Tool content on Gumroad ](https://willashley11.gumroad.com/l/ustjro) 
 
 THIS IS THE OLD VERSION README I STILL NEED TO UPDAE IT BUT BASICALLY THE SAME WITH SOME NEW VISUAL MODES ETC...  MUST TACKLE CPU LOAD NEXT IT IS A BEAST.
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
